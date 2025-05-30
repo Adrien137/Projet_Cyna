@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nginx-web-monitor
+  namespace: web
+  labels:
+    app: nginx-web
+spec:
+  selector:
+    matchLabels:
+      app: nginx-web
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
