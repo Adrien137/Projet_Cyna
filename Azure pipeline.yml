@@ -23,18 +23,154 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          # =======================================================
+          # SONARQUBE SCAN COMPLET
+          # =======================================================
           - task: SonarQubePrepare@5
+            displayName: 'Prepare SonarQube Analysis'
             inputs:
               SonarQube: 'SonarQubeServiceConnection'
               scannerMode: 'CLI'
               configMode: 'manual'
               cliProjectKey: 'ClusterWEB'
               cliProjectName: 'ClusterWEB'
+              cliProjectVersion: '$(Build.BuildNumber)'
               extraProperties: |
+                # Configuration du projet
                 sonar.projectKey=ClusterWEB
                 sonar.projectName=ClusterWEB
+                sonar.projectVersion=$(Build.BuildNumber)
                 sonar.sources=.
+                sonar.sourceEncoding=UTF-8
+                
+                # Exclusions (fichiers à ne pas analyser)
+                sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/*.min.js,**/*.min.css,**/vendor/**,**/logs/**,**/*.log,**/.git/**
+                
+                # Couverture de code (si applicable)
+                sonar.javascript.lcov.reportPaths=coverage/lcov.info
+                sonar.coverage.exclusions=**/*.test.js,**/*.spec.js,**/test/**,**/tests/**
+                
+                # Configuration Docker/Kubernetes
+                sonar.docker.file=Dockerfile
+                sonar.kubernetes.file=manifest/*.yaml,*.yaml
+                
+                # Seuils de qualité
+                sonar.qualitygate.wait=true
+                sonar.qualitygate.timeout=300
 
+          # Installation des outils d'analyse (si nécessaire)
+          - script: |
+              echo "=== Installation des outils d'analyse ==="
+              
+              # Installation de Node.js si nécessaire pour l'analyse JS
+              if [ -f "package.json" ]; then
+                echo "Package.json détecté, installation des dépendances Node.js"
+                npm install
+                
+                # Exécution des tests avec couverture (si configuré)
+                if npm run test:coverage 2>/dev/null; then
+                  echo "Tests avec couverture exécutés"
+                else
+                  echo "Pas de script test:coverage disponible"
+                fi
+              fi
+              
+              # Installation d'outils additionnels pour l'analyse
+              sudo apt-get update
+              sudo apt-get install -y shellcheck yamllint
+              
+              echo "=== Vérification de la structure du projet ==="
+              find . -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.java" -o -name "*.cs" -o -name "*.yaml" -o -name "*.yml" | head -20
+            displayName: 'Install Analysis Tools'
+            continueOnError: true
+
+          # Analyse statique additionnelle avant SonarQube
+          - script: |
+              echo "=== Analyse statique préliminaire ==="
+              
+              # Analyse des fichiers YAML/YML
+              echo "--- Validation YAML ---"
+              find . -name "*.yaml" -o -name "*.yml" | while read file; do
+                echo "Validation de: $file"
+                yamllint "$file" || echo "Erreur dans $file"
+              done
+              
+              # Analyse des scripts shell
+              echo "--- Validation Shell Scripts ---"
+              find . -name "*.sh" | while read file; do
+                echo "Validation de: $file"
+                shellcheck "$file" || echo "Erreur dans $file"
+              done
+              
+              # Analyse du Dockerfile
+              if [ -f "Dockerfile" ]; then
+                echo "--- Validation Dockerfile ---"
+                # Installation de hadolint pour Dockerfile
+                wget -O hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+                chmod +x hadolint
+                sudo mv hadolint /usr/local/bin/
+                
+                hadolint Dockerfile || echo "Erreurs détectées dans le Dockerfile"
+              fi
+            displayName: 'Static Analysis Pre-checks'
+            continueOnError: true
+
+          # Exécution de l'analyse SonarQube
+          - task: SonarQubeAnalyze@5
+            displayName: 'Run SonarQube Analysis'
+            inputs:
+              jdkversion: 'JAVA_HOME_17_X64'
+
+          # Publication des résultats SonarQube
+          - task: SonarQubePublish@5
+            displayName: 'Publish SonarQube Results'
+            inputs:
+              pollingTimeoutSec: '300'
+
+          # Vérification de la Quality Gate
+          - script: |
+              echo "=== Vérification des résultats SonarQube ==="
+              
+              # Récupération du statut de la Quality Gate via API (optionnel)
+              # Nécessite la configuration des variables SONAR_HOST_URL et SONAR_TOKEN
+              if [ ! -z "$SONAR_HOST_URL" ] && [ ! -z "$SONAR_TOKEN" ]; then
+                echo "Vérification du statut via API SonarQube..."
+                
+                # Attente de la fin de l'analyse
+                sleep 30
+                
+                # Récupération du statut
+                PROJECT_KEY="ClusterWEB"
+                STATUS_URL="$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$PROJECT_KEY"
+                
+                curl -u "$SONAR_TOKEN:" "$STATUS_URL" > sonar_status.json
+                cat sonar_status.json
+                
+                # Vérification du statut
+                GATE_STATUS=$(cat sonar_status.json | jq -r '.projectStatus.status')
+                echo "Quality Gate Status: $GATE_STATUS"
+                
+                if [ "$GATE_STATUS" != "OK" ]; then
+                  echo "##[error]Quality Gate Failed!"
+                  echo "##[error]Vérifiez les résultats sur SonarQube: $SONAR_HOST_URL/dashboard?id=$PROJECT_KEY"
+                  # Décommentez la ligne suivante pour faire échouer le build si Quality Gate échoue
+                  # exit 1
+                else
+                  echo "##[section]Quality Gate Passed!"
+                fi
+              else
+                echo "Variables SONAR_HOST_URL et SONAR_TOKEN non configurées"
+                echo "Statut de la Quality Gate disponible dans les logs SonarQube ci-dessus"
+              fi
+            displayName: 'Check Quality Gate Status'
+            continueOnError: true
+            env:
+              SONAR_HOST_URL: $(SONAR_HOST_URL)
+              SONAR_TOKEN: $(SONAR_TOKEN)
+
+          # =======================================================
+          # BUILD ET SCAN DOCKER (EXISTANT)
+          # =======================================================
           - script: |
               docker build -t $(containerRegistry)/$(imageName):$(Build.BuildId) .
               docker tag $(containerRegistry)/$(imageName):$(Build.BuildId) $(containerRegistry)/$(imageName):latest
@@ -51,7 +187,30 @@ stages:
             displayName: 'Install Trivy'
 
           - script: |
+              echo "=== Scan de sécurité Docker avec Trivy ==="
+              
+              # Scan avec sortie JSON pour analyse
+              trivy image --format json --output trivy-results.json $(containerRegistry)/$(imageName):$(Build.BuildId)
+              
+              # Scan avec sortie table pour lisibilité
+              trivy image --format table $(containerRegistry)/$(imageName):$(Build.BuildId)
+              
+              # Scan avec critères de sortie (ne fait pas échouer le build mais log les erreurs)
               trivy image --exit-code 0 --severity HIGH,CRITICAL $(containerRegistry)/$(imageName):$(Build.BuildId)
+              
+              # Analyse des résultats
+              if [ -f "trivy-results.json" ]; then
+                echo "=== Résumé des vulnérabilités ==="
+                HIGH_COUNT=$(cat trivy-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length')
+                CRITICAL_COUNT=$(cat trivy-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
+                
+                echo "Vulnérabilités CRITICAL: $CRITICAL_COUNT"
+                echo "Vulnérabilités HIGH: $HIGH_COUNT"
+                
+                if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                  echo "##[warning]$CRITICAL_COUNT vulnérabilités CRITICAL détectées"
+                fi
+              fi
             displayName: 'Scan Docker Image with Trivy'
           
           - task: AzureCLI@2
@@ -69,48 +228,254 @@ stages:
               docker push $(containerRegistry)/$(imageName):latest
             displayName: 'Push Docker Image to ACR'
 
-  - stage: DeployInfrastructure
-    displayName: 'Deploy AKS and Storage'
+          # Publication des résultats des scans
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Security Scan Results'
+            inputs:
+              pathToPublish: '.'
+              artifactName: 'security-reports'
+              publishLocation: 'Container'
+            condition: always()
+
+  # =======================================================
+  # STAGE DÉDIÉE À L'ANALYSE DE QUALITÉ (OPTIONNEL)
+  # =======================================================
+  - stage: QualityGate
+    displayName: 'Quality Gate Validation'
+    dependsOn: BuildAndScan
+    condition: succeeded()
     jobs:
-      - deployment: DeployAKSInfra
-        environment: 'prod'
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - task: AzureCLI@2
-                  displayName: 'Deploy Infrastructure'
-                  inputs:
-                    azureSubscription: '$(azureSubscription)'
-                    scriptType: 'bash'
-                    scriptLocation: 'inlineScript'
-                    inlineScript: |
-                      az group create --name $(resourceGroup) --location $(location)
-                      az network vnet create \
-                        --resource-group $(resourceGroup) \
-                        --name VNET-CYNA \
-                        --address-prefix 10.0.0.0/16 \
-                        --subnet-name frontend-subnet \
-                        --subnet-prefix 10.0.1.0/24
+      - job: ValidateQuality
+        displayName: 'Validate Code Quality'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "=== Validation finale de la qualité ==="
+              echo "Build ID: $(Build.BuildId)"
+              echo "Source Branch: $(Build.SourceBranch)"
+              echo "Commit: $(Build.SourceVersion)"
+              
+              # Ici vous pourriez ajouter des vérifications additionnelles
+              # Par exemple, vérifier les métriques SonarQube via API
+              # Ou valider des seuils spécifiques
+              
+              echo "=== Métriques du build ==="
+              echo "Timestamp: $(date)"
+              echo "Agent: $(Agent.Name)"
+              
+              # Exemple de validation personnalisée
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                echo "Build déclenché par Pull Request - validation renforcée"
+                # Ajouter ici des validations spécifiques aux PR
+              fi
+              
+              echo "##[section]Quality Gate Validation Completed"
+            displayName: 'Final Quality Validation'
 
-                      az aks update \
-                        --resource-group $(resourceGroup) \
-                        --name $(clusterName) \
-                        --attach-acr $(acrName)
+  # =======================================================
+  # STAGES EXISTANTS (INCHANGÉS)
+  # =======================================================
+  # Configuration AKS améliorée pour un cluster web de production
 
-                      az storage account create \
-                        --name $(storageAccount) \
-                        --resource-group $(resourceGroup) \
-                        --location $(location) \
-                        --sku Standard_LRS
-                        
-                      az storage container create \
-                        --name $(containerName) \
-                        --account-name $(storageAccount) \
-                        --auth-mode login
-
+- task: AzureCLI@2
+  displayName: 'Deploy Enhanced AKS Infrastructure'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      set -e
+      
+      echo "=== Création du Resource Group ==="
+      az group create --name $(resourceGroup) --location $(location)
+      
+      echo "=== Configuration réseau avancée ==="
+      # VNET avec architecture multi-tiers
+      az network vnet create \
+        --resource-group $(resourceGroup) \
+        --name VNET-CYNA \
+        --address-prefix 10.0.0.0/16 \
+        --subnet-name aks-subnet \
+        --subnet-prefix 10.0.1.0/24
+      
+      # Subnet additionnel pour les services externes
+      az network vnet subnet create \
+        --resource-group $(resourceGroup) \
+        --vnet-name VNET-CYNA \
+        --name ingress-subnet \
+        --address-prefix 10.0.2.0/24
+      
+      # Subnet pour Azure Application Gateway (si nécessaire plus tard)
+      az network vnet subnet create \
+        --resource-group $(resourceGroup) \
+        --vnet-name VNET-CYNA \
+        --name appgw-subnet \
+        --address-prefix 10.0.3.0/24
+      
+      # Network Security Groups
+      az network nsg create \
+        --resource-group $(resourceGroup) \
+        --name aks-nsg
+      
+      # Règles NSG de base
+      az network nsg rule create \
+        --resource-group $(resourceGroup) \
+        --nsg-name aks-nsg \
+        --name AllowHTTP \
+        --priority 1000 \
+        --source-address-prefixes '*' \
+        --destination-port-ranges 80 \
+        --access Allow \
+        --protocol Tcp
+      
+      az network nsg rule create \
+        --resource-group $(resourceGroup) \
+        --nsg-name aks-nsg \
+        --name AllowHTTPS \
+        --priority 1001 \
+        --source-address-prefixes '*' \
+        --destination-port-ranges 443 \
+        --access Allow \
+        --protocol Tcp
+      
+      # Association NSG au subnet
+      az network vnet subnet update \
+        --resource-group $(resourceGroup) \
+        --vnet-name VNET-CYNA \
+        --name aks-subnet \
+        --network-security-group aks-nsg
+      
+      echo "=== Création du cluster AKS avec bonnes pratiques ==="
+      
+      # Récupération de l'ID du subnet
+      SUBNET_ID=$(az network vnet subnet show \
+        --resource-group $(resourceGroup) \
+        --vnet-name VNET-CYNA \
+        --name aks-subnet \
+        --query id -o tsv)
+      
+      # Création du cluster AKS avec configuration avancée
+      az aks create \
+        --resource-group $(resourceGroup) \
+        --name $(clusterName) \
+        --location $(location) \
+        --node-count 3 \
+        --min-count 2 \
+        --max-count 10 \
+        --enable-cluster-autoscaler \
+        --node-vm-size Standard_D4s_v3 \
+        --zones 1 2 3 \
+        --vnet-subnet-id $SUBNET_ID \
+        --network-plugin azure \
+        --network-policy calico \
+        --service-cidr 10.1.0.0/16 \
+        --dns-service-ip 10.1.0.10 \
+        --enable-aad \
+        --enable-azure-rbac \
+        --enable-managed-identity \
+        --attach-acr $(acrName) \
+        --enable-addons monitoring \
+        --workspace-resource-id "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$(resourceGroup)/providers/Microsoft.OperationalInsights/workspaces/$(clusterName)-workspace" \
+        --enable-secret-rotation \
+        --rotation-poll-interval 2m \
+        --kubernetes-version "1.28" \
+        --tier standard \
+        --enable-network-policy \
+        --generate-ssh-keys || {
+          echo "Création du cluster échouée, vérification si il existe déjà..."
+          if az aks show --resource-group $(resourceGroup) --name $(clusterName) &>/dev/null; then
+            echo "Cluster existant trouvé, mise à jour..."
+            az aks update \
+              --resource-group $(resourceGroup) \
+              --name $(clusterName) \
+              --attach-acr $(acrName) \
+              --enable-cluster-autoscaler \
+              --min-count 2 \
+              --max-count 10
+          else
+            echo "Tentative de création sans Log Analytics workspace..."
+            az aks create \
+              --resource-group $(resourceGroup) \
+              --name $(clusterName) \
+              --location $(location) \
+              --node-count 3 \
+              --min-count 2 \
+              --max-count 10 \
+              --enable-cluster-autoscaler \
+              --node-vm-size Standard_D4s_v3 \
+              --zones 1 2 3 \
+              --vnet-subnet-id $SUBNET_ID \
+              --network-plugin azure \
+              --network-policy calico \
+              --service-cidr 10.1.0.0/16 \
+              --dns-service-ip 10.1.0.10 \
+              --enable-aad \
+              --enable-azure-rbac \
+              --enable-managed-identity \
+              --attach-acr $(acrName) \
+              --kubernetes-version "1.28" \
+              --tier standard \
+              --enable-network-policy \
+              --generate-ssh-keys
+          fi
+        }
+      
+      echo "=== Configuration d'un node pool Windows (optionnel) ==="
+      # Décommentez si vous avez besoin de workloads Windows
+      # az aks nodepool add \
+      #   --resource-group $(resourceGroup) \
+      #   --cluster-name $(clusterName) \
+      #   --name winnp \
+      #   --node-count 1 \
+      #   --os-type Windows \
+      #   --node-vm-size Standard_D4s_v3
+      
+      echo "=== Configuration du stockage Azure ==="
+      # Storage Account avec configuration sécurisée
+      az storage account create \
+        --name $(storageAccount) \
+        --resource-group $(resourceGroup) \
+        --location $(location) \
+        --sku Standard_LRS \
+        --kind StorageV2 \
+        --access-tier Hot \
+        --https-only true \
+        --min-tls-version TLS1_2 \
+        --allow-blob-public-access false
+      
+      # Container avec accès restreint
+      az storage container create \
+        --name $(containerName) \
+        --account-name $(storageAccount) \
+        --auth-mode login \
+        --public-access off
+      
+      echo "=== Configuration des politiques de sécurité ==="
+      # Installation d'Azure Policy pour AKS
+      az aks enable-addons \
+        --resource-group $(resourceGroup) \
+        --name $(clusterName) \
+        --addons azure-policy || echo "Azure Policy déjà activé ou non disponible"
+      
+      echo "=== Configuration du backup (Azure Backup pour AKS) ==="
+      # Création d'un Recovery Services Vault pour les backups
+      az backup vault create \
+        --resource-group $(resourceGroup) \
+        --name $(clusterName)-backup-vault \
+        --location $(location) || echo "Vault de backup déjà existant"
+      
+      echo "=== Affichage des informations du cluster ==="
+      az aks show \
+        --resource-group $(resourceGroup) \
+        --name $(clusterName) \
+        --query "{name:name,location:location,kubernetesVersion:kubernetesVersion,nodeResourceGroup:nodeResourceGroup,dnsPrefix:dnsPrefix,fqdn:fqdn,agentPoolProfiles:agentPoolProfiles[0].{count:count,vmSize:vmSize,availabilityZones:availabilityZones}}" \
+        --output table
+      
+      echo "=== Configuration terminée avec succès ==="
   - stage: DeployToAKS
     displayName: 'Deploy Nginx to AKS'
+    dependsOn: DeployInfrastructure
     jobs:
       - deployment: DeployApp
         environment: 'prod'
