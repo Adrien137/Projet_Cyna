@@ -270,9 +270,9 @@ stages:
             displayName: 'Final Quality Validation'
 
   # =======================================================
-Deploy Enhanced AKS Infrastructure
+Deploy AKS Infrastructure
   # =======================================================
-  # Configuration AKS améliorée pour un cluster web de production
+  # Configuration AKS pour un cluster web de production
 
 - task: AzureCLI@2
   displayName: 'Deploy Enhanced AKS Infrastructure'
