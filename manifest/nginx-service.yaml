@@ -1,12 +1,8 @@
 apiVersion: v1
-kind: Service
+kind: Namespace
 metadata:
-  name: nginx-service
-  namespace: web
-spec:
-  type: ClusterIP
-  selector:
-    app: nginx
-  ports:
-    - port: 80
-      targetPort: 80
+  name: web
+  labels:
+    name: web
+    tier: frontend
+    security: standard
