@@ -100,3 +100,15 @@ Pipeline d’intégration continue pour une application backend .NET :
 
 ---
 
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp-service
+spec:
+  selector:
+    app: webapp
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer
