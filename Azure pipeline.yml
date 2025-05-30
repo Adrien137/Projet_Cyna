@@ -1,0 +1,461 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  azureSubscription: 'Azure-RG-CYNA-PROD'
+  resourceGroup: 'RG-CYNA-PROD'
+  clusterName: 'ClusterWEB'
+  acrName: 'cynaacr'
+  location: 'westeurope'
+  namespace: 'web'
+  imageName: 'nginx-web'
+  containerRegistry: 'cynaacr.azurecr.io'
+  storageAccount: 'cynastorage'
+  containerName: 'backupdata'
+
+stages:
+  - stage: BuildAndScan
+    displayName: 'Build, Lint and Scan'
+    jobs:
+      - job: DockerBuild
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: SonarQubePrepare@5
+            inputs:
+              SonarQube: 'SonarQubeServiceConnection'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: 'ClusterWEB'
+              cliProjectName: 'ClusterWEB'
+              extraProperties: |
+                sonar.projectKey=ClusterWEB
+                sonar.projectName=ClusterWEB
+                sonar.sources=.
+
+          - script: |
+              docker build -t $(containerRegistry)/$(imageName):$(Build.BuildId) .
+              docker tag $(containerRegistry)/$(imageName):$(Build.BuildId) $(containerRegistry)/$(imageName):latest
+            displayName: 'Build Docker Image'
+
+          - script: |
+              # Installing Trivy...
+              sudo apt-get update
+              sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+              echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install trivy -y
+            displayName: 'Install Trivy'
+
+          - script: |
+              trivy image --exit-code 0 --severity HIGH,CRITICAL $(containerRegistry)/$(imageName):$(Build.BuildId)
+            displayName: 'Scan Docker Image with Trivy'
+          
+          - task: AzureCLI@2
+            displayName: 'Login to ACR'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Logging in to ACR...
+                az acr login --name $(acrName)
+
+          - script: |
+              docker push $(containerRegistry)/$(imageName):$(Build.BuildId)
+              docker push $(containerRegistry)/$(imageName):latest
+            displayName: 'Push Docker Image to ACR'
+
+  - stage: DeployInfrastructure
+    displayName: 'Deploy AKS and Storage'
+    jobs:
+      - deployment: DeployAKSInfra
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Deploy Infrastructure'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az group create --name $(resourceGroup) --location $(location)
+                      az network vnet create \
+                        --resource-group $(resourceGroup) \
+                        --name VNET-CYNA \
+                        --address-prefix 10.0.0.0/16 \
+                        --subnet-name frontend-subnet \
+                        --subnet-prefix 10.0.1.0/24
+
+                      az aks update \
+                        --resource-group $(resourceGroup) \
+                        --name $(clusterName) \
+                        --attach-acr $(acrName)
+
+                      az storage account create \
+                        --name $(storageAccount) \
+                        --resource-group $(resourceGroup) \
+                        --location $(location) \
+                        --sku Standard_LRS
+                        
+                      az storage container create \
+                        --name $(containerName) \
+                        --account-name $(storageAccount) \
+                        --auth-mode login
+
+  - stage: DeployToAKS
+    displayName: 'Deploy Nginx to AKS'
+    jobs:
+      - deployment: DeployApp
+        environment: 'prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: 'Checkout source code'
+                
+                - script: |
+                    # Contenu du répertoire de travail :
+                    ls -la $(Build.SourcesDirectory)
+                    # Recherche du fichier namespace.yaml :
+                    find $(Build.SourcesDirectory) -name "namespace.yaml"
+                  displayName: 'Debug - List files'
+                
+                - task: Kubernetes@1
+                  displayName: 'Create Namespace'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: '$(azureSubscription)'
+                    azureResourceGroup: '$(resourceGroup)'
+                    kubernetesCluster: '$(clusterName)'
+                    namespace: 'default'
+                    command: apply
+                    useConfigurationFile: true
+                    configuration: '$(Build.SourcesDirectory)/namespace.yaml'
+
+                - task: AzureCLI@2
+                  displayName: 'Install NGINX Ingress Controller'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(clusterName) --overwrite-existing
+                      
+                      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
+                      
+                      kubectl wait --namespace ingress-nginx \
+                        --for=condition=ready pod \
+                        --selector=app.kubernetes.io/component=controller \
+                        --timeout=300s
+                      
+                      kubectl get pods -n ingress-nginx
+                      kubectl get svc -n ingress-nginx
+
+                - task: Kubernetes@1
+                  displayName: 'Deploy Applications'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: '$(azureSubscription)'
+                    azureResourceGroup: '$(resourceGroup)'
+                    kubernetesCluster: '$(clusterName)'
+                    namespace: '$(namespace)'
+                    command: apply
+                    useConfigurationFile: true
+                    configuration: '$(Build.SourcesDirectory)/manifest/'
+                  
+                # Configuration kubectl explicite avant de récupérer l'IP
+                - task: Kubernetes@1
+                  displayName: 'Configure kubectl access'
+                  inputs:
+                    connectionType: 'Azure Resource Manager'
+                    azureSubscriptionEndpoint: '$(azureSubscription)'
+                    azureResourceGroup: '$(resourceGroup)'
+                    kubernetesCluster: '$(clusterName)'
+                    command: 'login'
+
+                - task: AzureCLI@2
+                  displayName: 'Get Ingress IP'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Configuration de kubectl pour AKS...
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(clusterName) --overwrite-existing
+                      
+                      # Vérification de la connectivité kubectl...
+                      kubectl cluster-info
+                      
+                      # Liste des services dans ingress-nginx namespace...
+                      kubectl get svc -n ingress-nginx || echo "Namespace ingress-nginx non trouvé"
+                      
+                      # Liste de tous les services LoadBalancer...
+                      kubectl get svc --all-namespaces --field-selector spec.type=LoadBalancer
+                      
+                      # Récupération de l'IP publique de l'Ingress Controller...
+                      
+                      # Tentative avec différents namespaces possibles
+                      for namespace in ingress-nginx nginx-ingress default $(namespace); do
+                        echo "Recherche dans le namespace: $namespace"
+                        
+                        # Différents noms possibles pour le service ingress
+                        for service_name in ingress-nginx-controller nginx-ingress-controller ingress-controller nginx-controller; do
+                          echo "  Tentative avec le service: $service_name"
+                          externalIP=$(kubectl get svc $service_name -n $namespace -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null || echo "")
+                          
+                          if [[ -n "$externalIP" && "$externalIP" != "null" ]]; then
+                            echo "IP publique trouvée : $externalIP (service: $service_name, namespace: $namespace)"
+                            echo "##vso[task.setvariable variable=externalIP;issecret=false]$externalIP"
+                            exit 0
+                          fi
+                        done
+                      done
+                      
+                      # Si aucune IP trouvée, attendre que le LoadBalancer soit prêt
+                      echo "Aucune IP trouvée immédiatement, attente de l'assignation du LoadBalancer..."
+                      echo "Ceci peut prendre 2-5 minutes (normal pour Azure LoadBalancer)"
+                      
+                      for i in {1..24}; do
+                        echo "Tentative $i/24 ($(($i * 15 / 60)) min $(($i * 15 % 60)) sec écoulées)..."
+                        
+                        # Vérifier le statut du LoadBalancer
+                        kubectl describe svc ingress-nginx-controller -n ingress-nginx 2>/dev/null | grep -A5 "LoadBalancer Ingress" || true
+                        
+                        # Réessayer avec le service le plus probable
+                        externalIP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null || echo "")
+                        
+                        if [[ -n "$externalIP" && "$externalIP" != "null" ]]; then
+                          echo "IP publique récupérée : $externalIP (après $(($i * 15)) secondes)"
+                          echo "##vso[task.setvariable variable=externalIP;issecret=false]$externalIP"
+                          exit 0
+                        fi
+                        
+                        # Attente progressive (plus courte au début)
+                        if [ $i -lt 8 ]; then
+                          echo "Attente 10 secondes..."
+                          sleep 10
+                        else
+                          echo "Attente 20 secondes..."
+                          sleep 20
+                        fi
+                      done
+                      
+                      # Impossible de récupérer l'IP publique après plusieurs tentatives
+                      echo "##[error]Impossible de récupérer l'IP publique après plusieurs tentatives"
+                      echo "Services LoadBalancer disponibles:"
+                      kubectl get svc --all-namespaces --field-selector spec.type=LoadBalancer
+                      exit 1
+
+                - task: AzureCLI@2
+                  displayName: 'Diagnostic - Fix ImagePullBackOff'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Configuration kubectl
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(clusterName) --overwrite-existing
+                      
+                      # Diagnostic des pods en erreur
+                      kubectl describe pods -n $(namespace) | grep -A10 -B5 "ImagePullBackOff\|ErrImagePull" || true
+                      
+                      # Vérification de l'accès ACR
+                      az acr login --name $(acrName)
+                      
+                      # Images disponibles dans ACR
+                      az acr repository list --name $(acrName) --output table
+                      az acr repository show-tags --name $(acrName) --repository $(imageName) --output table || echo "Repository $(imageName) introuvable"
+                      
+                      # Redémarrage des pods en erreur
+                      kubectl delete pods -n $(namespace) --field-selector=status.phase=Failed || true
+                      kubectl rollout restart deployment -n $(namespace) || true
+                      
+                      # Attente du redémarrage
+                      sleep 30
+                      kubectl get pods -n $(namespace) -o wide
+
+                - task: AzureCLI@2
+                  displayName: 'Final Status Check'
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      # Configuration kubectl
+                      az aks get-credentials --resource-group $(resourceGroup) --name $(clusterName) --overwrite-existing
+                      
+                      # Status des pods dans tous les namespaces
+                      kubectl get pods --all-namespaces -o wide
+                      
+                      # Status des services
+                      kubectl get svc --all-namespaces
+                      
+                      # Status spécifique de l'Ingress Controller
+                      kubectl get pods -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx
+                      kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=20 || true
+                      
+                      # Status de votre application dans le namespace $(namespace)
+                      kubectl get pods -n $(namespace) -o wide || echo "Namespace $(namespace) introuvable"
+                      kubectl get svc -n $(namespace) || echo "Pas de services dans $(namespace)"
+                      
+                      # Configuration de l'Ingress
+                      kubectl get ingress --all-namespaces || echo "Pas d'Ingress configuré"
+                      
+                      # Test de connectivité réseau
+                      kubectl get endpoints --all-namespaces | grep -v "none" || echo "Pas d'endpoints actifs"
+                      
+                      if [[ -n "$(externalIP)" && "$externalIP" != "null" ]]; then
+                        # IP LoadBalancer disponible
+                        echo "IP du LoadBalancer: $(externalIP)"
+                        echo "Vous pouvez accéder à votre application via : http://$(externalIP)"
+                      else
+                        # IP LoadBalancer non récupérée
+                        echo "Vérifiez manuellement avec : kubectl get svc -n ingress-nginx"
+                      fi
+
+  - stage: AnalyzeCluster
+    displayName: 'Analyze Existing AKS Cluster'
+    dependsOn: DeployToAKS
+    jobs:
+      - job: InspectAKS
+        displayName: 'Inspect AKS State'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          # Étape 1: Installation des outils
+          - script: |
+              set -e
+              echo "=== Installation de KubeAudit ==="
+              
+              # Variables
+              KUBEAUDIT_VERSION="0.22.0"
+              DOWNLOAD_URL="https://github.com/Shopify/kubeaudit/releases/download/v${KUBEAUDIT_VERSION}/kubeaudit_${KUBEAUDIT_VERSION}_linux_amd64.tar.gz"
+              
+              # Téléchargement et installation
+              curl -L --fail -o kubeaudit.tar.gz "${DOWNLOAD_URL}"
+              tar -xzf kubeaudit.tar.gz
+              sudo mv kubeaudit /usr/local/bin/
+              sudo chmod +x /usr/local/bin/kubeaudit
+              
+              # Vérification
+              kubeaudit version
+              
+              echo "=== Installation de jq ==="
+              sudo apt-get update && sudo apt-get install -y jq
+              
+              echo "=== Outils installés avec succès ==="
+            displayName: 'Install Tools (KubeAudit, jq)'
+
+          # Étape 2: Configuration AKS
+          - task: AzureCLI@2
+            displayName: 'Get AKS credentials'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "=== Configuration de l'accès AKS ==="
+                az aks get-credentials \
+                  --name $(clusterName) \
+                  --resource-group $(resourceGroup) \
+                  --overwrite-existing
+                
+                echo "=== Test de connexion ==="
+                kubectl cluster-info
+                kubectl get nodes
+
+          # Étape 3: Inspection des ressources
+          - script: |
+              echo "=== Listing des ressources Kubernetes ==="
+              
+              echo "--- Pods ---"
+              kubectl get pods -A -o wide
+              
+              echo "--- Services ---"
+              kubectl get svc -A
+              
+              echo "--- Deployments ---"
+              kubectl get deployments -A
+              
+              echo "--- Ingress ---"
+              kubectl get ingress -A
+              
+              echo "--- ConfigMaps ---"
+              kubectl get configmaps -A
+              
+              echo "--- Secrets ---"
+              kubectl get secrets -A
+            displayName: 'List Kubernetes resources'
+
+          # Étape 4: Scan de sécurité
+          - script: |
+              set -e
+              
+              echo "=== KubeAudit Security Scan ==="
+              
+              # Créer un répertoire pour les résultats
+              mkdir -p scan-results
+              
+              # Scan complet avec gestion d'erreur
+              echo "Lancement du scan de sécurité complet..."
+              kubeaudit all --format json > scan-results/kubeaudit-full.json || {
+                echo "Erreur détectée par kubeaudit. Création d'un JSON vide pour la suite."
+                echo "[]" > scan-results/kubeaudit-full.json
+                }
+              
+              # Scan par catégorie pour plus de détails
+              echo "=== Scans spécifiques ==="
+              
+              echo "Scan des privilèges..."
+              kubeaudit privesc --format json > scan-results/privesc.json || true
+              
+              echo "Scan des capabilities..."
+              kubeaudit caps --format json > scan-results/caps.json || true
+              
+              echo "Scan des ressources..."
+              kubeaudit resources --format json > scan-results/resources.json || true
+              
+              echo "Scan des images..."
+              kubeaudit image --format json > scan-results/image.json || true
+              
+              # Affichage en format table
+              echo "=== Résultats en format lisible ==="
+              kubeaudit all --format table
+              
+              # Analyse des résultats
+              echo "=== Analyse des résultats ==="
+              
+              if [ -f scan-results/kubeaudit-full.json ]; then
+                if jq empty scan-results/kubeaudit-full.json 2>/dev/null; then
+                  TOTAL_ISSUES=$(jq length scan-results/kubeaudit-full.json)
+                  echo "Nombre total d'issues: $TOTAL_ISSUES"
+              
+              echo "=== Copie du fichier principal ==="
+              cp scan-results/kubeaudit-full.json $(System.DefaultWorkingDirectory)/kubeaudit-results.json
+            displayName: 'Scan de sécurité KubeAudit'
+            continueOnError: true
+
+          # Étape 5: Publication des résultats
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish KubeAudit Results'
+            inputs:
+              pathToPublish: 'scan-results'
+              artifactName: 'security-scan-results'
+              publishLocation: 'Container'
+            condition: always()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Main Results JSON'
+            inputs:
+              pathToPublish: '$(System.DefaultWorkingDirectory)/kubeaudit-results.json'
+              artifactName: 'kubeaudit-main-results'
+              publishLocation: 'Container'
+            condition: always()
