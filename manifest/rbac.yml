@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web-service-account
+  namespace: web
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: web
+  name: web-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: web-role-binding
+  namespace: web
+subjects:
+- kind: ServiceAccount
+  name: web-service-account
+  namespace: web
+roleRef:
+  kind: Role
+  name: web-role
+  apiGroup: rbac.authorization.k8s.io
