@@ -1,4 +1,4 @@
-# 🛠️ Cyna – Exemples de Pipelines Azure DevOps
+# SÉCURITÉ DES RÉSEAUX INDUSTRIELS - France Cybersecurity, Image Cyna – Exemples de Pipelines Azure DevOps
 
 Ce dépôt contient une collection de pipelines YAML utilisés dans le cadre des projets DevOps de la société **Cyna**, notamment pour :
 
