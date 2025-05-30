@@ -256,10 +256,6 @@ stages:
               echo "Source Branch: $(Build.SourceBranch)"
               echo "Commit: $(Build.SourceVersion)"
               
-              # Ici vous pourriez ajouter des vérifications additionnelles
-              # Par exemple, vérifier les métriques SonarQube via API
-              # Ou valider des seuils spécifiques
-              
               echo "=== Métriques du build ==="
               echo "Timestamp: $(date)"
               echo "Agent: $(Agent.Name)"
@@ -274,7 +270,7 @@ stages:
             displayName: 'Final Quality Validation'
 
   # =======================================================
-  # STAGES EXISTANTS (INCHANGÉS)
+Deploy Enhanced AKS Infrastructure
   # =======================================================
   # Configuration AKS améliorée pour un cluster web de production
 
