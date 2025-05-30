@@ -12,12 +12,12 @@ Ce dépôt contient une collection de pipelines YAML utilisés dans le cadre des
 ## Structure du dépôt
 
 
-├── kubeaudit-pipeline.yml # Audit de sécurité Kubernetes avec publication JSON
-├── aks-deploy.yml # Déploiement d'applications et de manifests sur AKS
-├── terraform-deploy.yml # Déploiement d'infrastructure via Terraform
-├── artifact-publish.yml # Pipeline générique pour la publication de fichiers
-├── ci-cd-backend-dotnet.yml # CI/CD d’un backend .NET avec tests et sécurité
-├── readme.md # Présentation du dépôt
+kubeaudit-pipeline.yml # Audit de sécurité Kubernetes avec publication JSON
+aks-deploy.yml # Déploiement d'applications et de manifests sur AKS
+terraform-deploy.yml # Déploiement d'infrastructure via Terraform
+artifact-publish.yml # Pipeline générique pour la publication de fichiers
+ci-cd-backend-dotnet.yml # CI/CD d’un backend .NET avec tests et sécurité
+readme.md # Présentation du dépôt
 
 
 ---
