@@ -169,7 +169,7 @@ stages:
               SONAR_TOKEN: $(SONAR_TOKEN)
 
           # =======================================================
-          # BUILD ET SCAN DOCKER (EXISTANT)
+          # BUILD ET SCAN DOCKER
           # =======================================================
           - script: |
               docker build -t $(containerRegistry)/$(imageName):$(Build.BuildId) .
