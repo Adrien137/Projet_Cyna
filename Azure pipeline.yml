@@ -302,7 +302,7 @@ Deploy AKS Infrastructure
         --name ingress-subnet \
         --address-prefix 10.0.2.0/24
       
-      # Subnet pour Azure Application Gateway (si nécessaire plus tard)
+      # Subnet pour Azure Application Gateway (si nécessaire)
       az network vnet subnet create \
         --resource-group $(resourceGroup) \
         --vnet-name VNET-CYNA \
